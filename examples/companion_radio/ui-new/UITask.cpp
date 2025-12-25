@@ -167,13 +167,20 @@ public:
 
   int render(DisplayDriver& display) override {
     char tmp[80];
-    // node name
+    // node name + mod tag
     display.setTextSize(1);
     display.setColor(DisplayDriver::GREEN);
     char filtered_name[sizeof(_node_prefs->node_name)];
     display.translateUTF8ToBlocks(filtered_name, _node_prefs->node_name, sizeof(filtered_name));
-    display.setCursor(0, 0);
-    display.print(filtered_name);
+    const char *modded_label = "*modded*";
+    const int battery_reserved = 30; // battery icon plus padding
+    int modded_width = display.getTextWidth(modded_label);
+    int max_name_width = display.width() - (battery_reserved + modded_width + 2);
+    if (max_name_width > 0) {
+      display.drawTextEllipsized(0, 0, max_name_width, filtered_name);
+    }
+    display.setColor(DisplayDriver::LIGHT);
+    display.drawTextRightAlign(display.width() - battery_reserved - 1, 0, modded_label);
 
     // battery voltage
     renderBatteryIndicator(display, _task->getBattMilliVolts());
