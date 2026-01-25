@@ -12,7 +12,49 @@
 #endif
 #define TELEM_BME680_SEALEVELPRESSURE_HPA (1013.25)
 #include <Adafruit_BME680.h>
+#ifndef BME680_WARMUP_MS
+#define BME680_WARMUP_MS (3UL * 60UL * 1000UL)
+#endif
+#ifndef BME680_BURN_IN_MS
+#define BME680_BURN_IN_MS 0UL
+#endif
+#ifndef BME680_BURN_IN_INTERVAL_MS
+#define BME680_BURN_IN_INTERVAL_MS 5000UL
+#endif
+#ifndef BME680_GAS_HEATER_TEMP
+#define BME680_GAS_HEATER_TEMP 320
+#endif
+#ifndef BME680_GAS_HEATER_MS
+#define BME680_GAS_HEATER_MS 150
+#endif
+#ifndef BME680_TEMP_OVERSAMPLE
+#define BME680_TEMP_OVERSAMPLE BME680_OS_8X
+#endif
+#ifndef BME680_HUM_OVERSAMPLE
+#define BME680_HUM_OVERSAMPLE BME680_OS_2X
+#endif
+#ifndef BME680_PRESS_OVERSAMPLE
+#define BME680_PRESS_OVERSAMPLE BME680_OS_4X
+#endif
+#ifndef BME680_IIR_FILTER
+#define BME680_IIR_FILTER BME680_FILTER_SIZE_3
+#endif
+#ifndef BME680_GAS_RESISTANCE_KOHMS
+#define BME680_GAS_RESISTANCE_KOHMS 0
+#endif
 static Adafruit_BME680 BME680;
+static uint32_t BME680_warmup_start_ms = 0;
+static uint32_t BME680_last_warmup_read_ms = 0;
+static bool BME680_warmup_notice_logged = false;
+static bool BME680_on_wire1 = false;
+static bool wire1_ready = false;
+static inline uint32_t bme680WarmupWindowMs() {
+#if BME680_BURN_IN_MS > 0
+  return BME680_BURN_IN_MS;
+#else
+  return BME680_WARMUP_MS;
+#endif
+}
 #endif
 
 #ifdef ENV_INCLUDE_BMP085
@@ -165,6 +207,7 @@ bool EnvironmentSensorManager::begin() {
     #else
   Wire1.begin(ENV_PIN_SDA, ENV_PIN_SCL, 100000);
     #endif
+  wire1_ready = true;
   MESH_DEBUG_PRINTLN("Second I2C initialized on pins SDA: %d SCL: %d", ENV_PIN_SDA, ENV_PIN_SCL);
   #endif
 
@@ -179,8 +222,61 @@ bool EnvironmentSensorManager::begin() {
   #endif
 
   #if ENV_INCLUDE_BME680
-  if (BME680.begin(TELEM_BME680_ADDRESS, TELEM_WIRE)) {
-    MESH_DEBUG_PRINTLN("Found BME680 at address: %02X", TELEM_BME680_ADDRESS);
+  uint8_t bme680_address = TELEM_BME680_ADDRESS;
+  bool bme680_ok = BME680.begin(bme680_address, TELEM_WIRE);
+  BME680_on_wire1 = false;
+  if (!bme680_ok) {
+    const uint8_t alt_address = (TELEM_BME680_ADDRESS == 0x76) ? 0x77 : 0x76;
+    bme680_ok = BME680.begin(alt_address, TELEM_WIRE);
+    if (bme680_ok) {
+      bme680_address = alt_address;
+      MESH_DEBUG_PRINTLN("Found BME680 at alternate address: %02X", alt_address);
+    }
+  }
+  #if defined(PIN_WIRE1_SDA) && defined(PIN_WIRE1_SCL)
+  if (!bme680_ok) {
+    #ifdef NRF52_PLATFORM
+    if (!wire1_ready) {
+      Wire1.setPins(PIN_WIRE1_SDA, PIN_WIRE1_SCL);
+      Wire1.setClock(100000);
+      Wire1.begin();
+      wire1_ready = true;
+    }
+    #else
+    if (!wire1_ready) {
+      Wire1.begin(PIN_WIRE1_SDA, PIN_WIRE1_SCL, 100000);
+      wire1_ready = true;
+    }
+    #endif
+    bme680_address = TELEM_BME680_ADDRESS;
+    bme680_ok = BME680.begin(bme680_address, &Wire1);
+    if (!bme680_ok) {
+      const uint8_t alt_address = (TELEM_BME680_ADDRESS == 0x76) ? 0x77 : 0x76;
+      bme680_ok = BME680.begin(alt_address, &Wire1);
+      if (bme680_ok) {
+        bme680_address = alt_address;
+        MESH_DEBUG_PRINTLN("Found BME680 at alternate address: %02X (Wire1)", alt_address);
+      }
+    }
+    if (bme680_ok) {
+      BME680_on_wire1 = true;
+    }
+  }
+  #endif
+  if (bme680_ok) {
+    if (BME680_on_wire1) {
+      MESH_DEBUG_PRINTLN("Found BME680 on Wire1 at address: %02X", bme680_address);
+    } else {
+      MESH_DEBUG_PRINTLN("Found BME680 on Wire at address: %02X", bme680_address);
+    }
+    BME680.setTemperatureOversampling(BME680_TEMP_OVERSAMPLE);
+    BME680.setHumidityOversampling(BME680_HUM_OVERSAMPLE);
+    BME680.setPressureOversampling(BME680_PRESS_OVERSAMPLE);
+    BME680.setIIRFilterSize(BME680_IIR_FILTER);
+    BME680.setGasHeater(BME680_GAS_HEATER_TEMP, BME680_GAS_HEATER_MS);
+    BME680_warmup_start_ms = millis();
+    BME680_last_warmup_read_ms = 0;
+    BME680_warmup_notice_logged = false;
     BME680_initialized = true;
   } else {
     BME680_initialized = false;
@@ -353,13 +449,23 @@ bool EnvironmentSensorManager::querySensors(uint8_t requester_permissions, Cayen
 
     #if ENV_INCLUDE_BME680
     if (BME680_initialized) {
+      const uint32_t now = millis();
+      const uint32_t warmup_window_ms = bme680WarmupWindowMs();
+      const bool warmup_active = (warmup_window_ms > 0) && ((now - BME680_warmup_start_ms) < warmup_window_ms);
+      if (warmup_active && !BME680_warmup_notice_logged) {
+        MESH_DEBUG_PRINTLN("BME680 warmup active; gas telemetry disabled for %lu ms", (unsigned long)warmup_window_ms);
+        BME680_warmup_notice_logged = true;
+      }
       if (BME680.performReading()) {
         telemetry.addTemperature(TELEM_CHANNEL_SELF, BME680.temperature);
         telemetry.addRelativeHumidity(TELEM_CHANNEL_SELF, BME680.humidity);
         telemetry.addBarometricPressure(TELEM_CHANNEL_SELF, BME680.pressure / 100);
         telemetry.addAltitude(TELEM_CHANNEL_SELF, 44330.0 * (1.0 - pow((BME680.pressure / 100) / TELEM_BME680_SEALEVELPRESSURE_HPA, 0.1903)));
-        telemetry.addAnalogInput(next_available_channel, BME680.gas_resistance);
-        next_available_channel++;
+        if (!warmup_active) {
+          const float gas_value = BME680_GAS_RESISTANCE_KOHMS ? (BME680.gas_resistance / 1000.0f) : BME680.gas_resistance;
+          telemetry.addAnalogInput(next_available_channel, gas_value);
+          next_available_channel++;
+        }
       }
     }
     #endif
@@ -702,6 +808,19 @@ void EnvironmentSensorManager::stop_gps() {
 
 void EnvironmentSensorManager::loop() {
   static long next_gps_update = 0;
+
+  #if ENV_INCLUDE_BME680
+  if (BME680_initialized) {
+    const uint32_t now = millis();
+    const uint32_t warmup_window_ms = bme680WarmupWindowMs();
+    if (warmup_window_ms > 0 && (now - BME680_warmup_start_ms) < warmup_window_ms) {
+      if ((now - BME680_last_warmup_read_ms) >= BME680_BURN_IN_INTERVAL_MS) {
+        BME680.performReading();
+        BME680_last_warmup_read_ms = now;
+      }
+    }
+  }
+  #endif
 
   #if ENV_INCLUDE_GPS
   _location->loop();
