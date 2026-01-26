@@ -1,5 +1,8 @@
 #include "MyMesh.h"
+#include <Utils.h>
 #include <algorithm>
+#include <math.h>
+#include <helpers/sensors/LPPDataHelpers.h>
 
 /* ------------------------------ Config -------------------------------- */
 
@@ -54,6 +57,22 @@
 #define CLI_REPLY_DELAY_MILLIS      600
 
 #define LAZY_CONTACTS_WRITE_DELAY    5000
+
+static const char kBatteryInfoChannelSecretHex[] = "1cbfc5bff8423774fbf3f5c8db09c60d";
+
+static int batteryPercentFromMillivolts(uint16_t mv) {
+  const float v = (float)mv / 1000.0f;
+  const float min_v = 3.0f;
+  const float max_v = 4.2f;
+  float pct_f = (v - min_v) / (max_v - min_v) * 100.0f;
+  int pct = (int)roundf(pct_f);
+  if (pct < 0) {
+    pct = 0;
+  } else if (pct > 100) {
+    pct = 100;
+  }
+  return pct;
+}
 
 void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float snr) {
 #if MAX_NEIGHBOURS // check if neighbours enabled
@@ -305,6 +324,179 @@ mesh::Packet *MyMesh::createSelfAdvert() {
   uint8_t app_data_len = _cli.buildAdvertData(ADV_TYPE_REPEATER, app_data);
 
   return createAdvert(self_id, app_data, app_data_len);
+}
+
+void MyMesh::initBatteryInfoChannel() {
+  if (batteryinfo_channel_ready) {
+    return;
+  }
+
+  memset(&batteryinfo_channel, 0, sizeof(batteryinfo_channel));
+  if (!mesh::Utils::fromHex(batteryinfo_channel.secret, 16, kBatteryInfoChannelSecretHex)) {
+    MESH_DEBUG_PRINTLN("batteryinfo: invalid channel secret");
+    return;
+  }
+
+  mesh::Utils::sha256(batteryinfo_channel.hash, sizeof(batteryinfo_channel.hash), batteryinfo_channel.secret, 16);
+  batteryinfo_channel_ready = true;
+}
+
+int MyMesh::maxBatteryInfoBodyLen() const {
+  const int prefix_len = (int)strlen(_prefs.node_name) + 2; // "<name>: "
+  int max_body = MAX_PACKET_PAYLOAD - CIPHER_BLOCK_SIZE - 5 - prefix_len;
+  if (max_body < 0) {
+    max_body = 0;
+  }
+  return max_body;
+}
+
+bool MyMesh::sendBatteryInfoGroupText(const char* body, size_t body_len, int delay_millis) {
+  if (!batteryinfo_channel_ready) {
+    return false;
+  }
+
+  const int max_body = maxBatteryInfoBodyLen();
+  if (max_body <= 0) {
+    return false;
+  }
+  if (body_len > (size_t)max_body) {
+    body_len = (size_t)max_body;
+  }
+
+  uint8_t temp[MAX_PACKET_PAYLOAD];
+  uint32_t timestamp = getRTCClock()->getCurrentTimeUnique();
+  memcpy(temp, &timestamp, 4);
+  temp[4] = 0; // TXT_TYPE_PLAIN
+
+  const size_t name_len = strlen(_prefs.node_name);
+  const size_t prefix_len = name_len + 2;
+  size_t offset = 5;
+  memcpy(&temp[offset], _prefs.node_name, name_len);
+  offset += name_len;
+  temp[offset++] = ':';
+  temp[offset++] = ' ';
+
+  memcpy(&temp[offset], body, body_len);
+  temp[offset + body_len] = 0; // null terminator (not counted)
+
+  const size_t data_len = offset + body_len;
+  mesh::Packet* pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, batteryinfo_channel, temp, data_len);
+  if (pkt) {
+    sendFlood(pkt, delay_millis);
+    return true;
+  }
+  return false;
+}
+
+void MyMesh::sendBatteryInfoAdvert(int delay_millis) {
+  initBatteryInfoChannel();
+  if (!batteryinfo_channel_ready) {
+    return;
+  }
+
+  telemetry.reset();
+  const uint16_t battery_mv = board.getBattMilliVolts();
+  telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)battery_mv / 1000.0f);
+
+  sensors.querySensors(0xFF, telemetry);
+
+  float temperature = board.getMCUTemperature();
+  if (!isnan(temperature)) {
+    telemetry.addTemperature(TELEM_CHANNEL_SELF, temperature);
+  }
+
+  const uint8_t tlen = telemetry.getSize();
+  float temp_c = 0.0f;
+  float humidity_pct = 0.0f;
+  float pressure_hpa = 0.0f;
+  float altitude_m = 0.0f;
+  bool has_temp = false;
+  bool has_humidity = false;
+  bool has_pressure = false;
+  bool has_altitude = false;
+
+  LPPReader reader(telemetry.getBuffer(), tlen);
+  uint8_t channel = 0;
+  uint8_t type = 0;
+  while (reader.readHeader(channel, type)) {
+    switch (type) {
+      case LPP_TEMPERATURE: {
+        float value;
+        if (reader.readTemperature(value) && !has_temp) {
+          temp_c = value;
+          has_temp = true;
+        }
+        break;
+      }
+      case LPP_RELATIVE_HUMIDITY: {
+        float value;
+        if (reader.readRelativeHumidity(value) && !has_humidity) {
+          humidity_pct = value;
+          has_humidity = true;
+        }
+        break;
+      }
+      case LPP_BAROMETRIC_PRESSURE: {
+        float value;
+        if (reader.readPressure(value) && !has_pressure) {
+          pressure_hpa = value;
+          has_pressure = true;
+        }
+        break;
+      }
+      case LPP_ALTITUDE: {
+        float value;
+        if (reader.readAltitude(value) && !has_altitude) {
+          altitude_m = value;
+          has_altitude = true;
+        }
+        break;
+      }
+      default:
+        reader.skipData(type);
+        break;
+    }
+  }
+
+  const int max_body = maxBatteryInfoBodyLen();
+  if (max_body <= 0) {
+    return;
+  }
+
+  const float battery_v = (float)battery_mv / 1000.0f;
+  const int battery_pct = batteryPercentFromMillivolts(battery_mv);
+
+  char temp_str[16];
+  char hum_str[16];
+  char press_str[16];
+  char alt_str[16];
+
+  if (!has_temp) {
+    snprintf(temp_str, sizeof(temp_str), "na");
+  } else {
+    snprintf(temp_str, sizeof(temp_str), "%.1f", temp_c);
+  }
+  if (!has_humidity) {
+    snprintf(hum_str, sizeof(hum_str), "na");
+  } else {
+    snprintf(hum_str, sizeof(hum_str), "%.1f", humidity_pct);
+  }
+  if (!has_pressure) {
+    snprintf(press_str, sizeof(press_str), "na");
+  } else {
+    snprintf(press_str, sizeof(press_str), "%.1f", pressure_hpa);
+  }
+  if (!has_altitude) {
+    snprintf(alt_str, sizeof(alt_str), "na");
+  } else {
+    snprintf(alt_str, sizeof(alt_str), "%.0f", altitude_m);
+  }
+
+  char body[256];
+  snprintf(body, sizeof(body),
+           "battery=%.2fv %d%% temp=%sc hum=%s%% press=%shPa alt=%sm",
+           battery_v, battery_pct, temp_str, hum_str, press_str, alt_str);
+  sendBatteryInfoGroupText(body, strlen(body), delay_millis);
 }
 
 File MyMesh::openAppend(const char *fname) {
@@ -683,6 +875,8 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   set_radio_at = revert_radio_at = 0;
   _logging = false;
   region_load_active = false;
+  batteryinfo_channel_ready = false;
+  memset(&batteryinfo_channel, 0, sizeof(batteryinfo_channel));
 
 #if MAX_NEIGHBOURS
   memset(neighbours, 0, sizeof(neighbours));
@@ -780,6 +974,7 @@ void MyMesh::sendSelfAdvertisement(int delay_millis) {
   mesh::Packet *pkt = createSelfAdvert();
   if (pkt) {
     sendFlood(pkt, delay_millis);
+    sendBatteryInfoAdvert(delay_millis);
   } else {
     MESH_DEBUG_PRINTLN("ERROR: unable to create advertisement packet!");
   }
@@ -1082,7 +1277,10 @@ void MyMesh::loop() {
 
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
     mesh::Packet *pkt = createSelfAdvert();
-    if (pkt) sendFlood(pkt);
+    if (pkt) {
+      sendFlood(pkt);
+      sendBatteryInfoAdvert();
+    }
 
     updateFloodAdvertTimer(); // schedule next flood advert
     updateAdvertTimer();      // also schedule local advert (so they don't overlap)

@@ -100,6 +100,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   NeighbourInfo neighbours[MAX_NEIGHBOURS];
 #endif
   CayenneLPP telemetry;
+  mesh::GroupChannel batteryinfo_channel;
+  bool batteryinfo_channel_ready;
   unsigned long set_radio_at, revert_radio_at;
   float pending_freq;
   float pending_bw;
@@ -116,6 +118,10 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
   int handleRequest(ClientInfo* sender, uint32_t sender_timestamp, uint8_t* payload, size_t payload_len);
   mesh::Packet* createSelfAdvert();
+  void initBatteryInfoChannel();
+  void sendBatteryInfoAdvert(int delay_millis = 0);
+  bool sendBatteryInfoGroupText(const char* body, size_t body_len, int delay_millis);
+  int maxBatteryInfoBodyLen() const;
 
   File openAppend(const char* fname);
 
